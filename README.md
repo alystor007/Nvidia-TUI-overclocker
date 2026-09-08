@@ -3,6 +3,8 @@
 A lazydocker-style terminal UI for NVIDIA GPU overclocking, with live GPU
 telemetry, savable OC profiles, and a themeable interface.
 
+![Nvidia TUI Overclocker](nvidia-tui-overclocker.png)
+
 ## Files
 
 | File | Purpose |
