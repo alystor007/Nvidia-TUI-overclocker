@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 # ============================================================
 #  SCRIPTS
@@ -263,7 +264,7 @@ def prompt(stdscr, sh: int, sw: int, label: str, default: str = "") -> str | Non
     stdscr.refresh()
     res = stdscr.getstr()
     curses.noecho()
-    stdscr.timeout(500)
+    stdscr.timeout(100)
     raw = res[1] if isinstance(res, tuple) else res  # ncurses returns (n, b) or bare bytes
     text = raw.decode(errors="replace").strip()
     if text.startswith("\x1b"):   # Esc then Enter = cancel
@@ -336,11 +337,23 @@ def main(stdscr):
     help_overlay = False
     select_open = False
     log = ""
-    stdscr.timeout(500)   # auto-refresh: getch returns -1 after 500ms
+    # UI tick: getch returns -1 after 100ms -> smooth redraws.
+    # Telemetry (nvidia-smi) is throttled separately below (TELEMETRY_MS),
+    # so a faster UI never increases the pull rate.
+    stdscr.timeout(100)
+    TELEMETRY_MS = 2000   # how often nvidia-smi is actually called
+    stats, stats_at = {}, 0.0
 
+    # Flicker-free rendering: each frame is drawn into stdscr's virtual
+    # buffer (erase + redraw); refresh() diffs it against the physical
+    # screen and pushes only the changed cells (steady state: none).
     while True:
         active, active_name = get_status()
-        stats = get_gpu_stats()
+        # pull telemetry at its own cadence; between pulls we redraw
+        # the last values from the cache (no extra nvidia-smi)
+        now = time.monotonic()
+        if now - stats_at >= TELEMETRY_MS / 1000:
+            stats, stats_at = get_gpu_stats(), now
 
         status_word = "ACTIVE" if active else "INACTIVE"
         if active and active_name:
@@ -375,7 +388,7 @@ def main(stdscr):
         log_lines = (log or "(no action yet)").splitlines()
 
         # --- render ------------------------------------------------------
-        stdscr.clear()
+        stdscr.erase()
         h, w = stdscr.getmaxyx()
         sh, sw = max(1, h - 1), max(1, w - 1)   # safe bounds
 
@@ -507,6 +520,9 @@ def main(stdscr):
         stdscr.addnstr(sh - 1, max(0, w - len(note)), note, len(note),
                        curses.color_pair(4) | curses.A_BOLD)
 
+        # frame complete: refresh diffs the virtual buffer against the
+        # physical screen and rewrites only the cells that changed
+        # (steady state: none -> no flicker, no churn).
         stdscr.refresh()
 
         # --- input -------------------------------------------------------
