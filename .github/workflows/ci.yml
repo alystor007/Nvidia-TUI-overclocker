@@ -21,4 +21,4 @@ jobs:
         run: python -m py_compile gpu_tui.py apply_overclock.py reset_overclock.py
 
       - name: Lint
-        run: ruff check --select F,E gpu_tui.py apply_overclock.py reset_overclock.py
+        run: ruff check .
