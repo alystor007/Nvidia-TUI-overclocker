@@ -113,6 +113,10 @@ THEMES = {
     "gruvbox":   {"fg": [142, 167, 215, 223], "bg": 235, "btn": 216},
     "nord":      {"fg": [108, 173, 179, 252], "bg": 235, "btn": 117},
     "dracula":   {"fg": [46, 203, 190, 252],  "bg": 235, "btn": 226},
+    # omarchy.org palette (Tokyo Night base + Omarchy green accent).
+    # "transparent": -1 = the terminal's actual default fg/bg (needs
+    # use_default_colors()), no bkgd fill — terminal shows through.
+    "transparent": {"fg": [114, 124, 146, 111], "bg": -1, "btn": 118, "transparent": True},
 }
 
 THEME_FILE = os.path.join(CONFIG_DIR, "theme")
@@ -129,8 +133,17 @@ def apply_theme(stdscr, name: str) -> str:
     t = THEMES.get(name, THEMES["dark"])
     if max([*t["fg"], t["bg"], t["btn"]]) >= curses.COLORS:
         t, name = THEMES["dark"], "dark"
+    if t.get("transparent"):
+        # -1 only means "terminal default" once this flag is set.
+        curses.use_default_colors()
     for i, fg in enumerate(t["fg"]):
         curses.init_pair(i + 1, fg, t["bg"])
+    if t.get("transparent"):
+        # No background: pair 5 = the terminal's own default colors,
+        # and we skip bkgd() so its background shows through.
+        curses.init_pair(5, -1, -1)
+        curses.init_pair(6, t["btn"], -1)
+        return name
     # Pair 5 = window background: whole-screen bg follows the theme.
     # (Pair 0 is the terminal default and cannot be re-init'd on
     # Python >= 3.14 / ncurses 6.5+, hence a dedicated pair.)
