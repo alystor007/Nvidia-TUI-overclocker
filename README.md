@@ -73,6 +73,32 @@ A theme file (`~/.config/gpu-tui/theme`) stores the last-used color theme.
 While an OC is applied, the active profile name is written to
 `/tmp/gpu_oc_active` (removed on reset) so other tools can detect the state.
 
+## How the overclock works
+
+A profile is three cooperating controls, all applied via NVML:
+
+- **Power limit** (`power_w`) — the card's power ceiling. The GPU can never
+  draw more than this, so the power management algorithm backs the clock
+  off whenever the limit is hit. This is the main lever: a well-chosen
+  limit gives most of the performance for far less heat than chasing
+  clocks.
+
+- **Clock range** (`clock_min` .. `clock_max`) — the GPU's graphics clock
+  is locked inside this window. It cannot drop below `clock_min` (no
+  downclocking under load spikes) or rise above `clock_max` (the boost
+  ceiling).
+
+- **Clock offset** (`gfx_off` / `mem_off`) — shifts the operating point
+  along the chip's clock-vs-voltage curve: while running at clock *x*,
+  the driver requests the voltage the curve assigns to clock *x + offset*.
+  The chip therefore behaves like a slightly faster (or slower) chip at
+  the same clock — extra stability headroom, or lower voltage for the
+  same performance. The memory offset works the same way on the memory
+  clock (the driver stores it x2 internally; the profile keeps plain MHz).
+
+`reset_overclock.py` removes all three: power limit back to the factory
+default, clock lock released, offsets to 0.
+
 ## Notes
 
 - The scripts apply to GPU index 0. For multi-GPU setups, edit the
