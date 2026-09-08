@@ -1,0 +1,6 @@
+line-length = 160
+
+[lint]
+select = ["F", "E"]
+# `from pynvml import *` is the standard NVML usage pattern
+ignore = ["F403", "F405"]
