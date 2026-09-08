@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 alystor007
 """
 gpu-tui v3 — a lazydocker-style TUI for GPU overclocking.
 

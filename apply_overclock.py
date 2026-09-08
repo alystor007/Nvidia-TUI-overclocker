@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 alystor007
 """
 apply_overclock.py — applies an OC profile from profiles.json.
 

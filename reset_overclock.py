@@ -1,4 +1,6 @@
 #!/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 alystor007
 """reset_overclock.py — remove overclocking: power cap, locked clocks, clock offsets.
 
 NVML has no "0 / reset" value for these controls, so each one is restored
