@@ -42,8 +42,9 @@ def _reset_power():
 
 _step("power limit -> default", _reset_power)
 
-# ---- locked clocks: unlock (0,0); some drivers reject this ----
-_step("remove locked clocks", lambda: nvmlDeviceSetGpuLockedClocks(myGPU, 0, 0))
+# ---- locked clocks: unlock — SetGpuLockedClocks(0,0) is rejected by modern
+# drivers; the documented unlock is nvmlDeviceResetGpuLockedClocks ----
+_step("remove locked clocks", lambda: nvmlDeviceResetGpuLockedClocks(myGPU))
 
 # ---- P0 state: clear mem + gfx clock offsets ----
 def _clear_offset(ctype):
