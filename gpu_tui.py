@@ -34,6 +34,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 ACTIVATE_SCRIPT = os.path.join(_HERE, "apply_overclock.py")
 DEACTIVATE_SCRIPT = os.path.join(_HERE, "reset_overclock.py")
 STATUS_MARKER = "/tmp/gpu_oc_active"   # apply_overclock.py writes the active profile name here
+REBAR_SCRIPT = os.path.join(_HERE, "rebar_check.py")
 
 # ============================================================
 #  OC PROFILES
@@ -247,6 +248,46 @@ def get_gpu_stats() -> dict:
         return {}
 
 
+def _fmt_rebar(active: bool, bdf: str, name: str, bar: str, vram: str) -> str:
+    """One compact line; VRAM is dropped if the line would not fit an
+    80-col terminal (the value starts at PAD+8)."""
+    core = " ".join(p for p in ("ACTIVE" if active else "inactive", bdf, name) if p)
+    tail = f" BAR {bar}" if bar else ""
+    full = core + tail + (f", VRAM {vram} MiB" if vram else "")
+    return full if len(full) <= 66 else core + tail
+
+
+def get_rebar():
+    """ReBAR status from rebar_check.py. The BAR size is fixed at boot, so
+    this is queried once at startup — not on the telemetry cadence.
+    Returns a list of (text, active) rows, one per GPU."""
+    try:
+        r = subprocess.run(["python3", REBAR_SCRIPT],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return [("unknown (rebar_check.py could not be run)", False)]
+    rows = []
+    for line in r.stdout.splitlines():
+        if "ReBAR " not in line:
+            continue
+        active = line.rstrip().endswith("ReBAR ACTIVE")
+        bdf = line.split()[0]
+        mid = re.split(r"\[0x[0-9a-f]+\]\s+", line, 1)[0]
+        name = re.sub(r"^NVIDIA GeForce ", "", re.sub(r"^\S+\s*", "", mid).strip())
+        bar = re.search(r"largest BAR:\s+(\S+ \S+)", line)
+        vram = re.search(r"VRAM:\s+(\d+) MiB", line)
+        rows.append((_fmt_rebar(active, bdf, name,
+                                bar.group(1) if bar else "",
+                                vram.group(1) if vram else ""), active))
+    if not rows:
+        if "No NVIDIA GPU found" in r.stdout:
+            rows = [("no NVIDIA GPU found", False)]
+        else:
+            # missing script, python error, or unexpected output
+            rows = [("unknown (rebar_check.py failed)", False)]
+    return rows
+
+
 def prepend_log(log: str, entry: str) -> str:
     """Prepend an entry, keeping one line per entry."""
     return entry if not log else entry + "\n" + log
@@ -345,6 +386,8 @@ def main(stdscr):
     stdscr.timeout(100)
     TELEMETRY_MS = 2000   # how often nvidia-smi is actually called
     stats, stats_at = {}, 0.0
+    # ReBAR: BAR size is fixed at boot — query once, not per tick
+    rebar = get_rebar()
 
     # Flicker-free rendering: each frame is drawn into stdscr's virtual
     # buffer (erase + redraw); refresh() diffs it against the physical
@@ -442,13 +485,24 @@ def main(stdscr):
         stdscr.addnstr(oc_row, PAD + 12, sel_text, sw,
                        curses.color_pair(1) if active else curses.color_pair(2))
 
+        # --- ReBAR status (one row per GPU, right under the OC profile) ---
+        rebar_extra = 0
+        for i, (rtext, ractive) in enumerate(rebar):
+            row = oc_row + 1 + i
+            if row < sh:
+                stdscr.addnstr(row, PAD, "ReBAR:", sw,
+                               curses.color_pair(4) | curses.A_BOLD)
+                stdscr.addnstr(row, PAD + 8, rtext, sw,
+                               curses.color_pair(1) if ractive else curses.color_pair(2))
+                rebar_extra += 1
+
         # --- read-only notice (non-root): explain the mode at startup ---
         if read_only:
-            stdscr.addnstr(oc_row + 1, PAD,
-                           "running as non-root user — read-only mode "
-                           "(use sudo to apply OC / edit profiles)", sw,
+            stdscr.addnstr(oc_row + 1 + rebar_extra, PAD,
+                           "non-root: read-only mode (use sudo to apply "
+                           "OC / edit profiles)", sw,
                            curses.color_pair(2) | curses.A_BOLD)
-        ro_extra = 1 if read_only else 0
+        ro_extra = (1 if read_only else 0) + rebar_extra
 
         # --- button hints ---
         divider(oc_row + 1 + ro_extra)

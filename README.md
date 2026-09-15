@@ -12,6 +12,7 @@ telemetry, savable OC profiles, and a themeable interface.
 | `gpu_tui.py` | The TUI (run this). Live stats, profile menu, themes, action log. |
 | `apply_overclock.py` | Applies the selected OC profile (also usable standalone). |
 | `reset_overclock.py` | Restores factory defaults: power limit, locked clocks, clock offsets. |
+| `rebar_check.py` | Checks whether Resizable BAR (ReBAR) is active; also shown in the TUI. |
 
 ## Requirements
 
@@ -40,6 +41,7 @@ sudo python3 apply_overclock.py              # apply the selected profile
 sudo python3 apply_overclock.py <profile>    # apply a profile and select it
 python3 apply_overclock.py --list            # list profiles ('*' = selected)
 sudo python3 reset_overclock.py              # remove OC, restore factory defaults
+python3 rebar_check.py                       # ReBAR status (0 active, 1 not, 2 no GPU)
 ```
 
 ## Keys
@@ -74,6 +76,17 @@ file the OC scripts read:
 A theme file (`~/.config/gpu-tui/theme`) stores the last-used color theme.
 While an OC is applied, the active profile name is written to
 `/tmp/gpu_oc_active` (removed on reset) so other tools can detect the state.
+
+## ReBAR status
+
+Under the OC profile line the TUI shows the Resizable BAR (ReBAR) status
+per GPU, e.g. `ACTIVE 0000:05:00.0 RTX 4070 Ti SUPER BAR 16 GiB,
+VRAM 16376 MiB`. With ReBAR enabled the CPU maps the whole framebuffer
+instead of a small legacy BAR (256 MiB), which full GPU-Direct workloads
+need. It is a BIOS/UEFI feature and cannot be changed from the OS. The
+check reads BAR sizes from `/sys/bus/pci`, so it works without root or
+even a GPU driver; the status is queried once at startup, since the BAR
+size is fixed at boot.
 
 ## How the overclock works
 
