@@ -9,6 +9,7 @@ Keys:
   2 or d  -> Deactivate overclock
   n       -> Define and save a new OC profile
   x       -> Select which profile activation uses
+  f       -> Set fan speed (manual %, or 'auto' to revert) — needs sudo
   t       -> Cycle theme (saved between runs)
   q       -> Quit
   ?       -> Help overlay
@@ -35,6 +36,7 @@ ACTIVATE_SCRIPT = os.path.join(_HERE, "apply_overclock.py")
 DEACTIVATE_SCRIPT = os.path.join(_HERE, "reset_overclock.py")
 STATUS_MARKER = "/tmp/gpu_oc_active"   # apply_overclock.py writes the active profile name here
 REBAR_SCRIPT = os.path.join(_HERE, "rebar_check.py")
+FAN_SCRIPT = os.path.join(_HERE, "fan_control.py")
 
 # ============================================================
 #  OC PROFILES
@@ -332,6 +334,41 @@ def prepend_log(log: str, entry: str) -> str:
     return entry if not log else entry + "\n" + log
 
 
+def get_fan_state() -> dict:
+    """Fan mode/speed from fan_control.py status (JSON on stdout).
+
+    Read-only, so it runs on the 2s telemetry cadence like nvidia-smi.
+    Returns {} when the script is missing, pynvml is absent, or the GPU is
+    unavailable — the TUI then just shows the plain fan % (no mode tag).
+    """
+    try:
+        r = subprocess.run([sys.executable, FAN_SCRIPT, "status"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def set_fan_manual(pct: int) -> tuple[int, str]:
+    """fan_control.py set <PCT> — all fans to a fixed speed (needs root)."""
+    r = subprocess.run([sys.executable, FAN_SCRIPT, "set", str(pct)],
+                       capture_output=True, text=True)
+    return r.returncode, (r.stderr or r.stdout).strip()
+
+
+def set_fan_auto() -> tuple[int, str]:
+    """fan_control.py auto — all fans back to the driver's auto curve."""
+    r = subprocess.run([sys.executable, FAN_SCRIPT, "auto"],
+                       capture_output=True, text=True)
+    return r.returncode, (r.stderr or r.stdout).strip()
+
+
 # ============================================================
 #  PROFILE WIZARDS
 # ============================================================
@@ -426,6 +463,7 @@ def main(stdscr):
     TELEMETRY_MS = 2000   # how often nvidia-smi is actually called
     stats, stats_at = {}, 0.0
     prev_stats = {}   # last sample, for the bar-fill lerp
+    fan_state = {}    # fan mode from fan_control.py, refreshed with stats
     # ReBAR: BAR size is fixed at boot — query once, not per tick
     rebar = get_rebar()
 
@@ -440,6 +478,7 @@ def main(stdscr):
         if now - stats_at >= TELEMETRY_MS / 1000:
             prev_stats = stats
             stats, stats_at = get_gpu_stats(), now
+            fan_state = get_fan_state()
 
         status_word = "ACTIVE" if active else "INACTIVE"
         if active and active_name:
@@ -453,8 +492,9 @@ def main(stdscr):
                 hint = ("[q] Quit [?] Help  (read-only: sudo needed for "
                         "OC / profiles)")
             else:
-                hint = ("[1] Activate [2] Deactivate [x] Profiles "
-                        "[t] Theme [q] Quit [?] Help")
+                hint = (
+                    "[1] Activate [2] Deactivate [x] Profiles "
+                    "[f] Fan [t] Theme [q] Quit [?] Help")
 
         help_text = (
             [
@@ -464,6 +504,7 @@ def main(stdscr):
                 "  x ...... open the Profiles menu (Esc/q close)",
                 "  1-9 .... pick a profile (while the menu is open)",
                 "  d ...... delete the picked profile (menu open)",
+                "  f ...... set fan speed (a %, or 'auto' to revert); sudo",
                 "  t ...... cycle color theme",
                 "  q / Esc . quit",
                 "  Esc+Enter cancels a prompt",
@@ -584,10 +625,15 @@ def main(stdscr):
 
                 pmax = _f(stats.get("power_max"))
                 limit = "" if pmax <= 0 else " / " + _trim0(stats["power_max"]) + " W"
+                # Fan mode tag from fan_control.py: ' (auto)' / ' (manual)'.
+                # Empty when the script/pynvml is unavailable (plain %).
+                fmode = fan_state.get("policy", "")
+                fan_tag = f" ({fmode})" if fmode else ""
                 telemetry = [
                     ("◷ Clock",  _bar(val("clock"), _f(stats.get("clock_max"))),
                      f"{stats['clock']} MHz"),
-                    ("✵ Fan",    _bar(val("fan"), 100), f"{stats['fan']} %"),
+                    ("✵ Fan",    _bar(val("fan"), 100),
+                     f"{stats['fan']} %{fan_tag}"),
                     ("◉ Temp",   _bar(val("temp"), 90), f"{stats['temp']} C"),
                     ("⌁ Power",  _bar(val("power"), pmax),
                      f"{stats['power']} W{limit}"),
@@ -649,7 +695,7 @@ def main(stdscr):
                 break
             continue
         if read_only and c in (ord("1"), ord("a"), ord("2"), ord("d"),
-                               ord("n"), ord("x"), ord("t")):
+                               ord("n"), ord("x"), ord("t"), ord("f")):
             # read-only: hint, no error, no write
             log = prepend_log(log, f"[readonly] '{chr(c)}' needs sudo")
             continue
@@ -706,6 +752,27 @@ def main(stdscr):
             theme = apply_theme(stdscr, next_theme(theme))
             save_theme(theme)
             log = prepend_log(log, f"[theme] switched to {theme}")
+        elif c == ord("f"):
+            # Fan speed: a % sets manual, 'auto' reverts to the driver curve,
+            # empty/Esc cancels. Needs root (set/auto fail cleanly otherwise).
+            res = prompt(stdscr, sh, sw,
+                         "Fan % (30-100, or 'auto' to revert)")
+            if res is None or res == "":
+                continue   # Esc or empty: cancel, no change
+            res = res.strip().lower()
+            if res == "auto":
+                rc, out = set_fan_auto()
+                log = prepend_log(log, "[ok] fan auto" if rc == 0
+                                  else f"[err] fan: {out}")
+            else:
+                try:
+                    pct = int(res)
+                except ValueError:
+                    log = prepend_log(log, f"[fan] not a number: {res}")
+                    continue
+                rc, out = set_fan_manual(pct)
+                log = prepend_log(log, f"[ok] fan manual {pct}%" if rc == 0
+                                  else f"[err] fan: {out}")
 
 # ============================================================
 

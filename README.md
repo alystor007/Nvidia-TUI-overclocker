@@ -1,7 +1,8 @@
 # Nvidia TUI Overclocker
 
 A lazydocker-style terminal UI for NVIDIA GPU overclocking, with live GPU
-telemetry, savable OC profiles, and a themeable interface.
+telemetry (bar meters), savable OC profiles, fan control, and a themeable
+interface.
 
 ![Nvidia TUI Overclocker](nvidia-tui-overclocker.png)
 
@@ -12,6 +13,7 @@ telemetry, savable OC profiles, and a themeable interface.
 | `gpu_tui.py` | The TUI (run this). Live stats, profile menu, themes, action log. |
 | `apply_overclock.py` | Applies the selected OC profile (also usable standalone). |
 | `reset_overclock.py` | Restores factory defaults: power limit, locked clocks, clock offsets. |
+| `fan_control.py` | Reads/sets the GPU fan speed (drives the TUI's `f` key). |
 | `rebar_check.py` | Checks whether Resizable BAR (ReBAR) is active; also shown in the TUI. |
 
 ## Requirements
@@ -55,6 +57,7 @@ python3 rebar_check.py                       # ReBAR status (0 active, 1 not, 2 
 | `n` | Define + save a new profile (menu open) |
 | `d` | Delete the picked profile (menu open) |
 | `t` | Cycle color theme |
+| `f` | Set fan speed (manual %, or `auto` to revert) — needs sudo |
 | `?` / `h` | Help overlay |
 | `q` / `Esc` | Close menu / quit |
 
@@ -88,6 +91,15 @@ check reads BAR sizes from `/sys/bus/pci`, so it works without root or
 even a GPU driver; the status is queried once at startup, since the BAR
 size is fixed at boot.
 
+## Fan control
+
+Press `f` and enter a percentage (e.g. `60`) to pin all fans to that speed
+in manual mode, or `auto` to restore the driver's temperature curve. The
+Fan row tags the current mode inline — `45 % (manual)` / `45 % (auto)` —
+and falls back to a plain percentage when the script can't read the mode.
+Setting a speed needs root (the TUI runs `fan_control.py` under sudo);
+reading fan status does not.
+
 ## How the overclock works
 
 A profile is three cooperating controls, all applied via NVML:
@@ -96,7 +108,9 @@ A profile is three cooperating controls, all applied via NVML:
   draw more than this, so the power management algorithm backs the clock
   off whenever the limit is hit. This is the main lever: a well-chosen
   limit gives most of the performance for far less heat than chasing
-  clocks.
+  clocks. The TUI shows the active limit inline on the Power row —
+  `247 W / 260 W` (current draw / limit) — instead of a separate
+  max-power row.
 
 - **Clock range** (`clock_min` .. `clock_max`) — the GPU's graphics clock
   is locked inside this window. It cannot drop below `clock_min` (no
