@@ -223,8 +223,9 @@ def get_status() -> tuple[bool, str]:
 
 def get_gpu_stats() -> dict:
     """Query nvidia-smi. Returns dict; empty dict on failure."""
-    fields = ["clocks.sm", "fan.speed", "temperature.gpu",
-              "power.draw", "power.limit", "utilization.gpu", "memory.used"]
+    fields = ["clocks.sm", "clocks.max.sm", "fan.speed", "temperature.gpu",
+              "power.draw", "power.limit", "utilization.gpu",
+              "memory.used", "memory.total"]
     fmt = ",".join(fields)
     try:
         r = subprocess.run(
@@ -237,15 +238,53 @@ def get_gpu_stats() -> dict:
         vals = [v.strip() for v in r.stdout.split(",")]
         return {
             "clock":     vals[0],   # MHz
-            "fan":       vals[1],   # %
-            "temp":      vals[2],   # C
-            "power":     vals[3],   # W (current draw)
-            "power_max": vals[4],   # W (max/limit)
-            "util":      vals[5],   # %
-            "mem":       vals[6],   # MiB
+            "clock_max": vals[1],   # MHz (max graphics clock)
+            "fan":       vals[2],   # %
+            "temp":      vals[3],   # C
+            "power":     vals[4],   # W (current draw)
+            "power_max": vals[5],   # W (max/limit)
+            "util":      vals[6],   # %
+            "mem":       vals[7],   # MiB
+            "mem_total": vals[8],   # MiB
         }
     except Exception:
         return {}
+
+
+def _f(v) -> float:
+    """float(v); 0.0 on missing/garbage (nvidia-smi 'N/A', empty)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _trim0(s: str) -> str:
+    """260.00 -> 260, 262.50 -> 262.5; non-numeric strings pass through."""
+    try:
+        f = float(s)
+    except ValueError:
+        return s
+    return str(int(f)) if f == int(f) else f"{f:g}"
+
+
+def _bar(value: float, limit: float, width: int = 12) -> str:
+    """A ▓/░ fill string for a bar meter. Empty when there is no usable
+    limit, so the value column stays aligned across rows."""
+    if limit <= 0 or value < 0:
+        return ""
+    filled = min(width, max(0, int(round(value / limit * width))))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _lerp_field(prev: dict, cur: dict, key: str, frac: float) -> float:
+    """A telemetry field interpolated between the previous and current
+    sample; the current value when there is no previous one."""
+    c = _f(cur.get(key, ""))
+    if not prev:
+        return c
+    p = _f(prev.get(key, ""))
+    return p + (c - p) * frac
 
 
 def _fmt_rebar(active: bool, bdf: str, name: str, bar: str, vram: str) -> str:
@@ -386,6 +425,7 @@ def main(stdscr):
     stdscr.timeout(100)
     TELEMETRY_MS = 2000   # how often nvidia-smi is actually called
     stats, stats_at = {}, 0.0
+    prev_stats = {}   # last sample, for the bar-fill lerp
     # ReBAR: BAR size is fixed at boot — query once, not per tick
     rebar = get_rebar()
 
@@ -398,6 +438,7 @@ def main(stdscr):
         # the last values from the cache (no extra nvidia-smi)
         now = time.monotonic()
         if now - stats_at >= TELEMETRY_MS / 1000:
+            prev_stats = stats
             stats, stats_at = get_gpu_stats(), now
 
         status_word = "ACTIVE" if active else "INACTIVE"
@@ -531,19 +572,35 @@ def main(stdscr):
             if stats:
                 stdscr.addnstr(gpu_row, PAD, "GPU:", sw,
                                curses.color_pair(4) | curses.A_BOLD)
+                # Bar fills glide between samples: lerp from the
+                # previous pull (one window ago) to the current one;
+                # the numbers stay on the latest sample.
+                frac = 1.0
+                if prev_stats:
+                    frac = max(0.0, min(1.0, (now - stats_at) / (TELEMETRY_MS / 1000)))
+
+                def val(key: str) -> float:
+                    return _lerp_field(prev_stats, stats, key, frac)
+
+                pmax = _f(stats.get("power_max"))
+                limit = "" if pmax <= 0 else " / " + _trim0(stats["power_max"]) + " W"
                 telemetry = [
-                    ("◷ Clock",  f"{stats['clock']} MHz"),
-                    ("✵ Fan",    f"{stats['fan']} %"),
-                    ("◉ Temp",   f"{stats['temp']} C"),
-                    ("⌁ Power",  f"{stats['power']} W"),
-                    ("⏻ Max W",  f"{stats['power_max']} W"),
-                    ("◔ Util",   f"{stats['util']} %"),
-                    ("▤ Memory", f"{stats['mem']} MiB"),
+                    ("◷ Clock",  _bar(val("clock"), _f(stats.get("clock_max"))),
+                     f"{stats['clock']} MHz"),
+                    ("✵ Fan",    _bar(val("fan"), 100), f"{stats['fan']} %"),
+                    ("◉ Temp",   _bar(val("temp"), 90), f"{stats['temp']} C"),
+                    ("⌁ Power",  _bar(val("power"), pmax),
+                     f"{stats['power']} W{limit}"),
+                    ("◔ Util",   _bar(val("util"), 100), f"{stats['util']} %"),
+                    ("▤ Memory", _bar(val("mem"), _f(stats.get("mem_total"))),
+                     f"{stats['mem']} MiB"),
                 ]
-                for i, (label, val) in enumerate(telemetry):
-                    stdscr.addnstr(gpu_row + 1 + i, PAD + 1, label,
-                                   sw, curses.color_pair(4))
-                    stdscr.addnstr(gpu_row + 1 + i, PAD + 10, val,
+                for i, (label, bar, valstr) in enumerate(telemetry):
+                    # label(9) + bar(12) in the body color, value in ok
+                    stdscr.addnstr(gpu_row + 1 + i, PAD + 1,
+                                   f"{label:<9} {bar:<12}", sw,
+                                   curses.color_pair(4))
+                    stdscr.addnstr(gpu_row + 1 + i, PAD + 24, valstr,
                                    sw, curses.color_pair(1))
             else:
                 stdscr.addnstr(gpu_row, PAD, "GPU: (nvidia-smi unavailable)", sw,
