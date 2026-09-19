@@ -11,11 +11,16 @@ Keys:
   x       -> Select which profile activation uses
   f       -> Set fan speed (manual %, or 'auto' to revert) — needs sudo
   t       -> Cycle theme (saved between runs)
+  e       -> Edit the highlighted monitor (wizard: rate/VRR/color/SDR)
+             The Hyprland Display section is always visible and needs no
+             sudo (hyprctl talks to the user's compositor session).
   q       -> Quit
   ?       -> Help overlay
 
 Profiles live in ~/.config/gpu-tui/profiles.json — the single file the OC
 scripts read. /tmp/gpu_oc_active marks that an OC is currently applied.
+Display options persist to ~/.config/hypr/monitors-gpu-tui.conf (a file
+you source from monitors.conf once — see the hypr_monitor module).
 """
 
 import curses
@@ -25,6 +30,13 @@ import re
 import subprocess
 import sys
 import time
+
+try:
+    import hypr_monitor   # Hyprland display state (stdlib only)
+except ImportError:
+    hypr_monitor = None
+
+__version__ = "1.1.0"   # bump in the same commit as the git tag
 
 # ============================================================
 #  SCRIPTS
@@ -414,6 +426,393 @@ def new_profile(stdscr, sh: int, sw: int, profiles: dict) -> tuple[str, str]:
 
 
 # ============================================================
+#  DISPLAY  —  Hyprland monitors (hyprctl)
+# ============================================================
+# One row per monitor under ReBAR, edited through the display wizard
+# (jumpstart-style centered field box). Live changes go via
+# `hyprctl keyword monitor`; saves also rewrite the generated config
+# file (sourced from the user's monitors.conf). The section is always
+# visible when hyprctl is available; state is cached and re-queried on
+# demand (e / after a save), never on the 2s telemetry cadence.
+
+DISPLAY_MS = 15000   # refresh the display cache at most every 15s
+
+
+def _read_key(stdscr, restore_ms=100):
+    """Read one key, decoding raw arrow sequences so arrows work with or
+    without keypad(). Returns a curses code (-1 timeout, 27 bare Esc) or
+    "up"/"down"/"left"/"right". A split sequence (27, '[' then timeout)
+    is dropped, never treated as Esc."""
+    c = stdscr.getch()
+    if c != 27:
+        return c
+    # bare-Esc peek: 10ms (jumpstart-tui's value) — long enough for the
+    # '[' of a real arrow/fn-key sequence, short enough that Esc feels
+    # instant on top of curses.set_escdelay(25)
+    stdscr.timeout(10)
+    c2 = stdscr.getch()
+    stdscr.timeout(restore_ms)
+    if c2 not in (ord("["), ord("O")):
+        return 27
+    c3 = stdscr.getch()
+    stdscr.timeout(restore_ms)
+    if c3 == ord("A"):
+        return "up"
+    if c3 == ord("B"):
+        return "down"
+    if c3 == ord("C"):
+        return "right"
+    if c3 == ord("D"):
+        return "left"
+    if c3 == -1:
+        return -1
+    return 27
+
+
+def _display_ok() -> bool:
+    return hypr_monitor is not None and hypr_monitor.hyprctl_available()
+
+
+def _display_init():
+    """(rows, selected) for the Display section: ([], 0) when Hyprland
+    is not running, else one row per monitor (disabled ones included)."""
+    if not _display_ok():
+        return [], 0
+    mons = hypr_monitor.get_monitors()
+    if not mons:
+        return [], 0
+    state = hypr_monitor.load_display_state()
+    for m in mons:
+        m["opts"] = state.get(m["name"]) or _display_default(m)
+    return mons, 0
+
+
+def _display_default(m: dict) -> dict:
+    """Wizard defaults from the live state: native res, the current color
+    mode, the current VRR mode (off when the panel reports no VRR
+    support), current SDR values, and the monitor enabled."""
+    nat = hypr_monitor.native_mode(m)
+    hz = round(nat["hz"], 2)
+    # hyprctl's per-monitor vrr flag is live state, not config (it reads
+    # false unless VRR is actively engaged), so it can't seed the
+    # default — enable VRR (mode 1) unless the panel explicitly reports
+    # no support.
+    vrr = 0 if hypr_monitor.vrr_supported(m) is False else 1
+    return {"hz": hz,
+            "color": hypr_monitor.color_from_eotf(m.get("eotf", "")),
+            "vrr": vrr,
+            "bd": 10,
+            "sdr_b": round(float(m.get("sdr_brightness", 1.0)), 2),
+            "sdr_s": round(float(m.get("sdr_saturation", 1.0)), 2),
+            "enabled": bool(m.get("enabled", True))}
+
+
+def _display_refresh(state, selected, now) -> tuple[list, int]:
+    """Re-query hyprctl; keep the selected monitor by name (a hotplug
+    re-indexes the list) and carry the edited opts forward by name."""
+    if not _display_ok():
+        return [], 0
+    mons = hypr_monitor.get_monitors()
+    if not mons:
+        return [], 0
+    old = {m["name"]: m.get("opts") for m in state}
+    for m in mons:
+        m["opts"] = old.get(m["name"]) or _display_default(m)
+    sel_name = state[selected]["name"] if 0 <= selected < len(state) else None
+    selected = 0
+    for i, m in enumerate(mons):
+        if m["name"] == sel_name:
+            selected = i
+            break
+    return mons, selected
+
+
+def _display_summary(m: dict) -> str:
+    """Compact per-monitor row: name  WxH@HZ  [HDR|wide|sRGB][10-bit]
+    [sdr b/s]  [VRR <mode>]  (off)."""
+    o = m["opts"]
+    if not o.get("enabled", True):
+        return f"{m['name']}  off"
+    a = m["active"]
+    hz = o.get("hz") or a["hz"]
+    col = o.get("color", "srgb")
+    colw = "HDR" if col == "hdr" else ("wide" if col == "wide" else "sRGB")
+    bd = f" {int(o.get('bd', 10))}-bit" if col in ("hdr", "wide") else ""
+    sdr = ""
+    if col == "hdr":
+        sdr = f" sdr {o.get('sdr_b', 1.0):.2f}/{o.get('sdr_s', 1.0):.2f}"
+    vrr = "VRR " + hypr_monitor.VRR_SHORT[min(3, max(0, int(o.get("vrr", 0))))]
+    return f"{m['name']}  {a['w']}x{a['h']}@{hypr_monitor._hz(hz)}  {colw}{bd}{sdr}  {vrr}"
+
+
+def _display_line(m: dict) -> str:
+    """The `monitor =` line for one monitor's current opts. The vrr mode
+    is emitted as-is (0..3); a panel that reports no VRR support is
+    forced to 0."""
+    o = m["opts"]
+    vrr = min(3, max(0, int(o.get("vrr", 0))))
+    if hypr_monitor.vrr_supported(m) is False:
+        vrr = 0
+    return hypr_monitor.build_line(
+        m, enabled=o.get("enabled", True), hz=o.get("hz"),
+        color=o.get("color", "srgb"), vrr=vrr,
+        bitdepth=int(o.get("bd", 10)),
+        sdr_brightness=o.get("sdr_b", 1.0), sdr_saturation=o.get("sdr_s", 1.0))
+
+
+# --- display wizard (port of the jumpstart field-box wizard) ---
+
+_DISPLAY_ALL_FIELDS = (
+    ("Refresh (Hz)", "hz"),
+    ("VRR", "vrr"),
+    ("Color", "color"),
+    ("Bit depth", "bd"),
+    ("SDR brightness", "sdr_b"),
+    ("SDR saturation", "sdr_s"),
+    ("Enabled", "enabled"),
+)
+
+# Action hint above the bottom border — also the widest content in the
+# box, so it drives the minimum width (see display_wizard).
+_WIZARD_HINT = "↑↓ move · ←→ adjust · Enter save · Esc cancel"
+
+
+def _display_fields(mon: dict, multi: bool) -> list:
+    """(label, key, active) rows — always the full set, so hidden
+    options stay visible (dimmed). A field is active only when it
+    applies in the current state: Bit depth needs color=hdr|wide,
+    SDR rows need color=hdr, Enabled needs 2+ monitors, everything
+    else needs the monitor enabled (a disabled monitor shows just
+    its active Enabled row)."""
+    o = mon["opts"]
+    on = o.get("enabled", True)
+    out = []
+    for label, key in _DISPLAY_ALL_FIELDS:
+        col = o.get("color", "srgb")
+        if key == "bd":
+            en = on and col in ("hdr", "wide")
+        elif key in ("sdr_b", "sdr_s"):
+            en = on and col == "hdr"
+        elif key == "enabled":
+            en = multi
+        else:
+            en = on
+        out.append((label, key, bool(en)))
+    return out
+
+
+def _display_field_value(mon: dict, key: str) -> str:
+    o = mon["opts"]
+    if key == "hz":
+        txt = hypr_monitor._hz(o.get("hz", 0))
+        if hypr_monitor.vrr_available_at(mon, o.get("hz", 0)) is False:
+            txt += "*"
+        return txt
+    if key == "vrr":
+        return hypr_monitor.VRR_SHORT[min(3, max(0, int(o.get("vrr", 0))))]
+    if key == "color":
+        return o.get("color", "srgb")
+    if key == "bd":
+        return f"{int(o.get('bd', 10))}-bit"
+    if key == "sdr_b":
+        return f"{o.get('sdr_b', 1.0):.2f}"
+    if key == "sdr_s":
+        return f"{o.get('sdr_s', 1.0):.2f}"
+    return "on" if o.get("enabled", True) else "off"
+
+
+def _display_error(mon: dict) -> str:
+    """Error line: the selected rate lacks VRR while a VRR mode is
+    requested, or the panel reports no VRR support at all."""
+    o = mon["opts"]
+    vrr = min(3, max(0, int(o.get("vrr", 0))))
+    if vrr > 0 and hypr_monitor.vrr_supported(mon) is False:
+        return "this monitor reports no VRR support"
+    if vrr > 0 and hypr_monitor.vrr_available_at(mon, o.get("hz", 0)) is False:
+        return f"no VRR at {hypr_monitor._hz(o.get('hz', 0))} Hz"
+    return ""
+
+
+def _display_draw(stdscr, sh, sw, top, left, bw, bh, title, mon, fields,
+                  active_i, error):
+    """Wizard box: border, title, one row per field (labels right-justified
+    into a shared column, a fixed " : " separator, values left-justified;
+    the active row gets a full-width highlight band behind the text),
+    the action hint one row above the bottom border, and the error line
+    over the bottom border (red)."""
+    H, W = stdscr.getmaxyx()
+    attr = curses.color_pair(4)
+    for r in range(top, top + bh):
+        if r < H - 1:
+            stdscr.addnstr(r, left, " " * bw, bw)
+    for r in range(top, top + bh):
+        if r >= H - 1:
+            break
+        stdscr.addch(r, left, "┌" if r == top else ("└" if r == top + bh - 1 else "│"))
+        stdscr.addch(r, left + bw - 1, "┐" if r == top else ("┘" if r == top + bh - 1 else "│"))
+    stdscr.addnstr(top, left + 1, "─" * (bw - 2), bw - 2, attr)
+    stdscr.addnstr(top + bh - 1, left + 1, "─" * (bw - 2), bw - 2, attr)
+    stdscr.addnstr(top, left + 2, title, bw - 4, curses.color_pair(3) | curses.A_BOLD)
+    # Columns (per the alignment reference): labels right-justified so
+    # every ":" lands in one shared column, a fixed " : " separator, and
+    # values left-justified in their column. The whole "label : value"
+    # block is centered inside the box. The active row is marked by a
+    # full-width highlight band behind its text (reverse spaces).
+    label_w = max(len(label) for label, _, _ in fields)
+    value_w = max(len(_display_field_value(mon, key)) for _, key, _ in fields)
+    x0 = left + 2 + max(0, ((bw - 4) - (label_w + 3 + value_w)) // 2)
+    vcol = x0 + label_w + 3            # value column (after " : ")
+    vwidth = max(1, left + bw - 2 - vcol)    # to the interior right edge
+    for fi, (label, key, active) in enumerate(fields):
+        row0 = top + 2 + fi
+        if row0 >= H - 1:
+            break
+        if fi == active_i:
+            stdscr.addnstr(row0, left + 1, " " * (bw - 2), bw - 2, curses.A_REVERSE)
+        la = curses.color_pair(6) | curses.A_BOLD
+        if not active:
+            la = curses.color_pair(6) | curses.A_DIM
+        if fi == active_i:
+            la |= curses.A_REVERSE
+        stdscr.addnstr(row0, x0, label.rjust(label_w) + " :", vwidth + label_w, la)
+        text = _display_field_value(mon, key)
+        if len(text) > vwidth:
+            text = text[:vwidth]
+        va = curses.color_pair(4) | curses.A_BOLD
+        if not active:
+            va |= curses.A_DIM
+        if fi == active_i:
+            va |= curses.A_REVERSE
+        stdscr.addnstr(row0, vcol, text, vwidth, va)
+    if top + bh - 2 < H - 1:
+        draw_hint(stdscr, top + bh - 2, left + 2, _WIZARD_HINT, left + bw - 1)
+    if error and top + bh - 1 < H - 1:
+        stdscr.addnstr(top + bh - 1, left + 1, error, bw - 2, curses.color_pair(2))
+
+
+def display_wizard(stdscr, sh: int, sw: int, mons: list, sel: int) -> str:
+    """Edit one monitor's options in the field-box wizard. Returns a log
+    message. Save applies every monitor's line live (hyprctl keyword) and
+    rewrites the generated config file; failures are reported in the log.
+    mons[sel]['opts'] is edited in place."""
+    mon = mons[sel]
+    multi = len(mons) > 1
+    # Fixed box height: the wizard always shows the full field set
+    # (7 rows — hidden options dimmed), so the box never resizes.
+    bh = 3 + 2 + len(_DISPLAY_ALL_FIELDS) + 1
+    title = f"Display: {mon['name']}"
+    i = 0
+
+    def adjust(key, up: bool) -> bool:
+        """Nudge the field one step; True when the value moved."""
+        o = mon["opts"]
+        if key == "hz":
+            rates = hypr_monitor.rates_at_native(mon)   # highest first
+            if len(rates) <= 1:
+                return False
+            j = min(range(len(rates)), key=lambda k: abs(rates[k] - o.get("hz", 0)))
+            j = j - 1 if up else j + 1
+            if 0 <= j < len(rates) and rates[j] != o.get("hz"):
+                o["hz"] = rates[j]
+                return True
+            return False
+        if key == "vrr":
+            v = min(3, max(0, int(o.get("vrr", 0))))
+            o["vrr"] = (v + 1) % 4 if up else (v - 1) % 4
+            return True
+        if key == "enabled":
+            o[key] = bool(up)
+            return True
+        if key == "color":
+            modes = hypr_monitor.COLOR_MODES
+            cur = o.get("color", "srgb")
+            if cur not in modes:
+                cur = "srgb"
+            o["color"] = modes[(modes.index(cur) + (1 if up else -1)) % len(modes)]
+            return True
+        if key == "bd":
+            o["bd"] = 8 if int(o.get("bd", 10)) == 10 else 10
+            return True
+        # sdr_b / sdr_s: step 0.05, clamped
+        v = o.get(key, 1.0) + (0.05 if up else -0.05)
+        o[key] = round(min(3.0, max(0.1, v)), 2)
+        return True
+
+    stdscr.timeout(-1)
+    try:
+        while True:
+            # Re-measure every pass: the screen may have been resized
+            # while we're open (a stale size would push the border past
+            # the edge and crash addch). Width: just wide enough for the
+            # hint (the widest content) — border + 1 space padding each
+            # side, +1 breathing room — and degrade on small screens.
+            sh, sw = stdscr.getmaxyx()
+            bw = min(len(_WIZARD_HINT) + 4, max(10, sw - 2))
+            top = max(0, (sh - bh) // 2)
+            left = max(1, (sw - bw) // 2)
+            fields = _display_fields(mon, multi)
+            if i >= len(fields):
+                i = len(fields) - 1
+            _display_draw(stdscr, sh, sw, top, left, bw, bh,
+                          title, mon, fields, i, _display_error(mon))
+            stdscr.refresh()
+            c = _read_key(stdscr, restore_ms=-1)
+            if c == curses.KEY_RESIZE:
+                # Close on resize: the box is rebuilt from the current
+                # size next time it opens; nothing is saved.
+                return "[display] cancelled (window resized)"
+            if c in (27, ord("q")):
+                return "[display] cancelled"
+            if c in (10, 13, curses.KEY_ENTER):
+                break
+            if c in (curses.KEY_UP, "up"):
+                # Move up, wrapping, skipping dim (hidden) fields.
+                n = len(fields)
+                j = i
+                for _ in range(n):
+                    j = (j - 1) % n
+                    if fields[j][2]:
+                        break
+                i = j
+            elif c in (curses.KEY_DOWN, "down"):
+                n = len(fields)
+                j = i
+                for _ in range(n):
+                    j = (j + 1) % n
+                    if fields[j][2]:
+                        break
+                i = j
+            elif c in (curses.KEY_LEFT, "left"):
+                # Adjust only active fields.
+                if fields[i][2]:
+                    adjust(fields[i][1], False)
+            elif c in (curses.KEY_RIGHT, "right"):
+                if fields[i][2]:
+                    adjust(fields[i][1], True)
+            # any other key: ignore, redraw next pass
+    finally:
+        stdscr.timeout(100)
+
+    # save: apply every monitor's line live, then persist all lines and
+    # the per-monitor state (live first so a config write never outlives
+    # a failed apply)
+    errs = []
+    for m in mons:
+        ok, out = hypr_monitor.apply_line(_display_line(m))
+        if not ok:
+            errs.append(f"{m['name']}: {out}")
+    okp = hypr_monitor.persist_file(hypr_monitor.DISPLAY_CONF,
+                                    [_display_line(m) for m in mons])
+    saved = hypr_monitor.save_display_state({m["name"]: m["opts"] for m in mons})
+    if errs:
+        return "[err] " + "; ".join(errs)
+    msg = f"[display] saved ({len(mons)} monitor{'' if len(mons) == 1 else 's'})"
+    if not (okp and saved):
+        msg += "  [warn] config not saved"
+    return msg
+
+
+# ============================================================
 #  BANNER  —  "NVIDIA OVERCLOCK" with an eye/swoosh mark
 # ============================================================
 # Each row is (left, right): left = logo + "NVIDIA" (drawn in the
@@ -429,10 +828,23 @@ BANNER = [
 
 BANNER_ROWS = len(BANNER)   # 5
 
+# Minimum window that can render every section at once — border, banner,
+# status + OC profile, ReBAR, Display, hints, the ? help overlay (the
+# tallest content), log, footer — in the worst case (2 GPUs, 2 monitors,
+# read-only mode, help open). Below this, the TUI shows a "window too
+# small" notice instead of a broken layout; the check re-runs every
+# frame, so a live resize in either direction is picked up automatically.
+MIN_ROWS = 36
+MIN_COLS = 78
+
 
 def main(stdscr):
     curses.curs_set(0)
     curses.start_color()
+    # ncurses waits up to this many ms to decide a lone 0x1B is a
+    # bare Esc vs the start of an arrow/fn-key sequence; cap it so
+    # Esc is not sluggish (the app's own 10ms peek adds on top).
+    curses.set_escdelay(25)
     theme = apply_theme(stdscr, load_theme())
 
     # Non-root = read-only: display only (status, profiles, telemetry).
@@ -467,6 +879,12 @@ def main(stdscr):
     # ReBAR: BAR size is fixed at boot — query once, not per tick
     rebar = get_rebar()
 
+    # Hyprland display section — always visible when hyprctl is
+    # available; editing needs no root (hyprctl, user session)
+    display_wizard_open = False
+    display_state, display_sel = _display_init()
+    display_at = 0.0
+
     # Flicker-free rendering: each frame is drawn into stdscr's virtual
     # buffer (erase + redraw); refresh() diffs it against the physical
     # screen and pushes only the changed cells (steady state: none).
@@ -479,6 +897,10 @@ def main(stdscr):
             prev_stats = stats
             stats, stats_at = get_gpu_stats(), now
             fan_state = get_fan_state()
+        if display_state and now - display_at >= DISPLAY_MS / 1000:
+            display_state, display_sel = _display_refresh(
+                display_state, display_sel, now)
+            display_at = now
 
         status_word = "ACTIVE" if active else "INACTIVE"
         if active and active_name:
@@ -488,13 +910,14 @@ def main(stdscr):
         elif select_open:
             hint = "[1-9] pick  [n] new  [d] delete  [Esc/q] close"
         else:
+            hint = ("[1] Activate [2] Deactivate [x] Profiles [f] Fan "
+                    "[t] Theme [q] Quit [?] Help")
             if read_only:
                 hint = ("[q] Quit [?] Help  (read-only: sudo needed for "
                         "OC / profiles)")
-            else:
-                hint = (
-                    "[1] Activate [2] Deactivate [x] Profiles "
-                    "[f] Fan [t] Theme [q] Quit [?] Help")
+            if display_state:
+                # display editing works in read-only mode too (hyprctl)
+                hint = "[e] Edit [↑↓] select  " + hint
 
         help_text = (
             [
@@ -505,6 +928,7 @@ def main(stdscr):
                 "  1-9 .... pick a profile (while the menu is open)",
                 "  d ...... delete the picked profile (menu open)",
                 "  f ...... set fan speed (a %, or 'auto' to revert); sudo",
+                "  e ...... edit the highlighted monitor (wizard, no sudo)",
                 "  t ...... cycle color theme",
                 "  q / Esc . quit",
                 "  Esc+Enter cancels a prompt",
@@ -536,6 +960,36 @@ def main(stdscr):
             for r in range(1, H - 2):
                 win.addnstr(r, 0, "│", 1, attr)
                 win.addnstr(r, W - 2, "│", 1, attr)
+
+        # Too small for the layout: a notice instead of a broken UI.
+        # Input is routed by what is open: an open wizard gets Esc as its
+        # cancel (any other key just waits for a resize); otherwise
+        # Esc/q quit the TUI. The size check re-runs every frame, so
+        # resizing back to a usable size restores the full UI and the
+        # wizard resumes where it left off.
+        if h < MIN_ROWS or w < MIN_COLS:
+            border(stdscr, h, w)
+            if h >= 7:
+                msg = (f"window too small — minimum required: "
+                       f"{MIN_ROWS} rows x {MIN_COLS} cols")
+                sub = ("resize the window to continue"
+                       "   [Esc] close wizard  [q] Quit")
+                r = h // 2 - 1
+                stdscr.addnstr(r, max(0, (w - len(msg)) // 2), msg, w,
+                               curses.color_pair(2) | curses.A_BOLD)
+                stdscr.addnstr(r + 1, max(0, (w - len(sub)) // 2), sub, w,
+                               curses.color_pair(4))
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == 27 and display_wizard_open:
+                # Esc cancels the open wizard without saving
+                log = prepend_log(log, "[display] cancelled (window too small)")
+                display_wizard_open = False
+                display_state, display_sel = _display_refresh(
+                    display_state, display_sel, time.monotonic())
+            elif key in (ord("q"), 27):
+                break
+            continue
 
         PAD = 4     # horizontal indent (padding) for the banner block
         TOP = 1     # blank row above the banner
@@ -578,13 +1032,28 @@ def main(stdscr):
                                curses.color_pair(1) if ractive else curses.color_pair(2))
                 rebar_extra += 1
 
+        # --- Hyprland display section (one row per monitor) ---
+        disp_extra = 0
+        if display_state:
+            stdscr.addnstr(oc_row + 1 + rebar_extra, PAD, "Display:", sw,
+                           curses.color_pair(4) | curses.A_BOLD)
+            disp_extra += 1
+            for i, m in enumerate(display_state):
+                row = oc_row + 1 + rebar_extra + disp_extra
+                if row >= sh:
+                    break
+                cur = i == display_sel
+                stdscr.addnstr(row, PAD + 2, _display_summary(m), sw,
+                               curses.color_pair(1) if cur else curses.color_pair(4))
+                disp_extra += 1
+
         # --- read-only notice (non-root): explain the mode at startup ---
         if read_only:
-            stdscr.addnstr(oc_row + 1 + rebar_extra, PAD,
+            stdscr.addnstr(oc_row + 1 + rebar_extra + disp_extra, PAD,
                            "non-root: read-only mode (use sudo to apply "
                            "OC / edit profiles)", sw,
                            curses.color_pair(2) | curses.A_BOLD)
-        ro_extra = (1 if read_only else 0) + rebar_extra
+        ro_extra = (1 if read_only else 0) + rebar_extra + disp_extra
 
         # --- button hints ---
         divider(oc_row + 1 + ro_extra)
@@ -673,6 +1142,11 @@ def main(stdscr):
 
         stdscr.addnstr(sh - 1, 0, ("─" * sw), sw)   # footer (never last row)
         border(stdscr, h, w)
+        # version pinned bottom-left; status note bottom-right. The
+        # minimum-width guard keeps them from colliding on a narrow frame.
+        left = f" Nvidia TUI Overclocker v{__version__}"
+        stdscr.addnstr(sh - 1, 1, left, sw - 2,
+                       curses.color_pair(4) | curses.A_BOLD)
         note = f" theme: {theme} [t]   profile: {selected} [x] "
         if select_open:
             note += " [menu open]"
@@ -685,7 +1159,18 @@ def main(stdscr):
         stdscr.refresh()
 
         # --- input -------------------------------------------------------
-        c = stdscr.getch()
+        if display_wizard_open:
+            # before getch: no key is swallowed between 'e' and the wizard
+            log = prepend_log(log, display_wizard(stdscr, sh, sw,
+                                                  display_state, display_sel))
+            display_wizard_open = False
+            display_state, display_sel = _display_refresh(
+                display_state, display_sel, time.monotonic())
+            continue
+        # arrows are raw ESC sequences (no keypad): decode them only when
+        # the Display section is visible, so a bare Esc still quits
+        c = (_read_key(stdscr) if (display_state and not select_open)
+             else stdscr.getch())
         if c == -1:        # timeout — just redraw
             continue
         if c in (ord("q"), 27):
@@ -693,6 +1178,16 @@ def main(stdscr):
                 select_open = False
             else:
                 break
+            continue
+        if c == ord("e") and display_state and not select_open:
+            # not root-gated: hyprctl talks to the user's compositor
+            display_wizard_open = True
+            continue
+        if c == "up" and display_state and not select_open:
+            display_sel = (display_sel - 1) % len(display_state)
+            continue
+        if c == "down" and display_state and not select_open:
+            display_sel = (display_sel + 1) % len(display_state)
             continue
         if read_only and c in (ord("1"), ord("a"), ord("2"), ord("d"),
                                ord("n"), ord("x"), ord("t"), ord("f")):
@@ -778,6 +1273,9 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    if "--version" in sys.argv[1:]:
+        print(f"Nvidia TUI Overclocker v{__version__}")
+        sys.exit(0)
     try:
         curses.wrapper(main)
     except KeyboardInterrupt:

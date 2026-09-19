@@ -1,8 +1,8 @@
 # Nvidia TUI Overclocker
 
 A lazydocker-style terminal UI for NVIDIA GPU overclocking, with live GPU
-telemetry (bar meters), savable OC profiles, fan control, and a themeable
-interface.
+telemetry (bar meters), savable OC profiles, fan control, Hyprland display
+control, and a themeable interface.
 
 ![Nvidia TUI Overclocker](nvidia-tui-overclocker.png)
 
@@ -10,20 +10,23 @@ interface.
 
 | File | Purpose |
 |------|---------|
-| `gpu_tui.py` | The TUI (run this). Live stats, profile menu, themes, action log. |
+| `gpu_tui.py` | The TUI (run this). Live stats, profile menu, Display section, themes, action log. |
 | `apply_overclock.py` | Applies the selected OC profile (also usable standalone). |
 | `reset_overclock.py` | Restores factory defaults: power limit, locked clocks, clock offsets. |
 | `fan_control.py` | Reads/sets the GPU fan speed (drives the TUI's `f` key). |
 | `rebar_check.py` | Checks whether Resizable BAR (ReBAR) is active; also shown in the TUI. |
+| `hypr_monitor.py` | Hyprland display state — drives the Display section (stdlib only, no pynvml). |
 
 ## Requirements
 
 - Linux with an NVIDIA GPU and a recent driver (NVML)
 - Python 3.10+
-- `pynvml` — the only third-party dependency:
+- `pynvml` — the only third-party dependency for the GPU/OC side:
   ```
   pip install -r requirements.txt
   ```
+- The **Display** section needs Hyprland running (`hyprctl` on PATH). It is
+  optional — without it the section stays hidden and everything else works.
 
 ## Usage
 
@@ -35,6 +38,12 @@ sudo python3 gpu_tui.py
 
 Without sudo the TUI runs in read-only mode: live stats, status, and profile
 viewing work, but OC/profile actions are disabled.
+
+Show the version:
+
+```
+python3 gpu_tui.py --version
+```
 
 Standalone:
 
@@ -58,6 +67,10 @@ python3 rebar_check.py                       # ReBAR status (0 active, 1 not, 2 
 | `d` | Delete the picked profile (menu open) |
 | `t` | Cycle color theme |
 | `f` | Set fan speed (manual %, or `auto` to revert) — needs sudo |
+| `e` | Edit the highlighted monitor (wizard) |
+| `↑↓` | Move the monitor selection (Display section) |
+| `←→` | Adjust the active field (wizard open) |
+| `Enter` | Save wizard changes (wizard open) |
 | `?` / `h` | Help overlay |
 | `q` / `Esc` | Close menu / quit |
 
@@ -90,6 +103,36 @@ need. It is a BIOS/UEFI feature and cannot be changed from the OS. The
 check reads BAR sizes from `/sys/bus/pci`, so it works without root or
 even a GPU driver; the status is queried once at startup, since the BAR
 size is fixed at boot.
+
+## Display (Hyprland)
+
+When Hyprland is running, the TUI shows a **Display** section under the ReBAR
+line with one row per connected monitor, e.g.:
+
+```
+DP-1  2560x1440@165  HDR 10-bit sdr 1.00/1.00  VRR on
+HDMI-A-1  1920x1080@60  sRGB  VRR off
+```
+
+The section talks to your compositor session directly via `hyprctl`, so it
+**needs no sudo** — it stays editable even when the rest of the TUI is in
+read-only mode.
+
+Highlight a monitor and press `e` to open the edit wizard: move fields with
+`↑↓`, adjust the active field with `←→`, and save with `Enter`. Fields per
+monitor:
+
+- **Refresh** — one of the rates at the monitor's native resolution
+- **VRR** — `off` / `on` / `fullscreen only` / `fullscreen with video or game`
+- **Color** — `srgb` / `wide` / `hdr`
+- **Bit depth** — e.g. `10-bit` (HDR/wide only)
+- **SDR brightness** / **SDR saturation** (HDR only)
+- **Enabled** — disable a monitor (shown only with 2+ monitors)
+
+Changes apply live through `hyprctl` and are also written to a generated
+config file, `~/.config/hypr/monitors-gpu-tui.conf`. You wire it in once by
+adding `source = ~/.config/hypr/monitors-gpu-tui.conf` to your
+`monitors.conf` — the tool never edits that file itself.
 
 ## Fan control
 
