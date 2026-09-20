@@ -36,7 +36,7 @@ try:
 except ImportError:
     hypr_monitor = None
 
-__version__ = "1.1.0"   # bump in the same commit as the git tag
+__version__ = "1.2.0"   # bump in the same commit as the git tag
 
 # ============================================================
 #  SCRIPTS
@@ -263,6 +263,60 @@ def get_gpu_stats() -> dict:
         }
     except Exception:
         return {}
+
+
+def get_gpu_processes():
+    """Top VRAM-consuming processes, from nvidia-smi's compute-apps query.
+
+    A separate call from get_gpu_stats(): nvidia-smi accepts only one
+    --query-* switch per invocation, so the process list is its own
+    subprocess on the same telemetry cadence. Returns a list of
+    (name, mib) tuples sorted by VRAM usage descending, capped at the top 6;
+    [] on any failure (missing binary, non-zero exit, unparseable rows).
+    """
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    procs = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("pid,"):
+            continue
+        # csv row: pid, process_name, used_gpu_memory. Split on the FIRST
+        # comma (pid) and the LAST comma (memory) so names containing commas
+        # survive; the driver reports "N/A" for names it can't map.
+        first = line.index(",") if "," in line else -1
+        last = line.rfind(",")
+        if first == -1 or last == first:
+            continue
+        pid = line[:first].strip()
+        name = line[first + 1:last].strip()
+        # nvidia-smi reports the full command line (a long path + args);
+        # show just the executable's base name so the 15-char column is
+        # readable ("chromium", not "/usr/lib/chromium/chromium").
+        if name and name not in ("N/A", "[N/A]"):
+            name = name.split()[0].rsplit("/", 1)[-1]
+        mem = line[last + 1:].strip()
+        # Bare integer with nounits; tolerate a unit suffix ("96 MiB") so a
+        # driver/format change can never silently drop every row.
+        first_token = mem.split()[0] if mem.split() else ""
+        digits = "".join(c for c in first_token if c.isdigit())
+        if not digits:
+            continue
+        mem_v = int(digits)
+        if name in ("", "N/A", "[N/A]"):
+            name = f"pid {pid}" if pid else "unknown"
+        procs.append((name, mem_v))
+    procs.sort(key=lambda p: p[1], reverse=True)
+    return procs[:6]
 
 
 def _f(v) -> float:
@@ -876,6 +930,7 @@ def main(stdscr):
     stats, stats_at = {}, 0.0
     prev_stats = {}   # last sample, for the bar-fill lerp
     fan_state = {}    # fan mode from fan_control.py, refreshed with stats
+    procs = []        # top VRAM processes, refreshed with stats
     # ReBAR: BAR size is fixed at boot — query once, not per tick
     rebar = get_rebar()
 
@@ -897,6 +952,14 @@ def main(stdscr):
             prev_stats = stats
             stats, stats_at = get_gpu_stats(), now
             fan_state = get_fan_state()
+            new_procs = get_gpu_processes()
+            # Log a process-count change (not every 2s tick): if the column
+            # ever goes empty, the log shows whether nvidia-smi reported zero
+            # (environment) vs. the last non-empty count.
+            if len(new_procs) != len(procs):
+                log = prepend_log(log, f"[telemetry] nvidia-smi: "
+                                       f"{len(new_procs)} process(es)")
+            procs = new_procs
         if display_state and now - display_at >= DISPLAY_MS / 1000:
             display_state, display_sel = _display_refresh(
                 display_state, display_sel, now)
@@ -1082,6 +1145,12 @@ def main(stdscr):
             if stats:
                 stdscr.addnstr(gpu_row, PAD, "GPU:", sw,
                                curses.color_pair(4) | curses.A_BOLD)
+                # Second column: top-6 VRAM processes (separate nvidia-smi
+                # query, same cadence). Starts clear of the value column,
+                # which can run to ~13 chars ("210 W / 304 W") from PAD+24.
+                PROC_COL = PAD + 42
+                stdscr.addnstr(gpu_row, PROC_COL, "Top VRAM procs:", sw,
+                               curses.color_pair(4) | curses.A_BOLD)
                 # Bar fills glide between samples: lerp from the
                 # previous pull (one window ago) to the current one;
                 # the numbers stay on the latest sample.
@@ -1117,10 +1186,21 @@ def main(stdscr):
                                    curses.color_pair(4))
                     stdscr.addnstr(gpu_row + 1 + i, PAD + 24, valstr,
                                    sw, curses.color_pair(1))
+                    # process column: name (left, 15 wide) + MiB (right)
+                    if i < len(procs):
+                        pname, pmem = procs[i]
+                        stdscr.addnstr(gpu_row + 1 + i, PROC_COL,
+                                       pname[:15].ljust(15), sw,
+                                       curses.color_pair(4))
+                        stdscr.addnstr(gpu_row + 1 + i, PROC_COL + 17,
+                                       f"{pmem:>5} MiB", sw,
+                                       curses.color_pair(1))
+                # pane is 7 rows: header + 6 telemetry + 1 empty spacer row
+                last_used = gpu_row + len(telemetry) + 1
             else:
                 stdscr.addnstr(gpu_row, PAD, "GPU: (nvidia-smi unavailable)", sw,
                                curses.color_pair(2))
-            last_used = gpu_row + len(telemetry)
+                last_used = gpu_row
         else:
             last_used = gpu_row
 

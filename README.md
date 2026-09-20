@@ -93,6 +93,15 @@ A theme file (`~/.config/gpu-tui/theme`) stores the last-used color theme.
 While an OC is applied, the active profile name is written to
 `/tmp/gpu_oc_active` (removed on reset) so other tools can detect the state.
 
+## GPU telemetry
+
+The GPU pane shows live stats as bar meters — clock, fan, temperature,
+power (current / limit), utilization, and VRAM — refreshed every 2 seconds.
+A second column lists the **top 6 VRAM-consuming processes** (name and MiB),
+sourced from the same driver query as the stats. With no processes running
+the column stays blank; when the driver can't map a process name it shows
+the PID instead.
+
 ## ReBAR status
 
 Under the OC profile line the TUI shows the Resizable BAR (ReBAR) status
